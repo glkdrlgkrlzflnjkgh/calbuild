@@ -1,0 +1,692 @@
+use clap::Parser;
+use duct::cmd;
+use rayon::prelude::*;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+type AnyError = Box<dyn Error + Send + Sync>;
+
+/// calbuild: declarative C++ build with projects and parallel compilation.
+#[derive(Parser, Debug)]
+#[command(name = "calbuild")]
+#[command(about = "A small declarative build system", long_about = None)]
+struct Cli {
+    /// Path to the calbuild config file
+    #[arg(short, long, default_value = "calbuild.cb")]
+    config: PathBuf,
+
+    /// List all projects
+    #[arg(long)]
+    list: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Project {
+    name: String,
+    language: String,
+    sources_pattern: String,
+    include_dirs: Vec<String>,
+    cxx_flags: Vec<String>,
+    output: String,
+}
+
+#[derive(Debug)]
+enum CompileOutcome {
+    Skipped,
+    Compiled,
+}
+
+#[derive(Debug, Default)]
+struct BuildStats {
+    successful_compiles: AtomicUsize,
+    skipped_compiles: AtomicUsize,
+    failed_jobs: AtomicUsize,
+}
+
+fn main() -> Result<(), AnyError> {
+    let cli = Cli::parse();
+
+    let projects = load_config(&cli.config)?;
+    let cache_map = load_cache();
+    let cache = Arc::new(Mutex::new(cache_map));
+
+    if cli.list {
+        list_projects(&projects);
+        return Ok(());
+    }
+
+    if projects.is_empty() {
+        eprintln!("No projects defined in config.");
+        std::process::exit(1);
+    }
+
+    for project in &projects {
+        build_project(project, &cache)?;
+    }
+
+    {
+        let cache_guard = cache.lock().unwrap();
+        save_cache(&*cache_guard)?;
+    }
+
+    Ok(())
+}
+
+// =========================
+// Executable resolution (silent)
+// =========================
+
+fn resolve_program(prog: &str) -> String {
+    if prog.contains('\\') || prog.contains('/') {
+        return prog.to_string();
+    }
+
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    #[cfg(windows)]
+    let exts: &[&str] = &["", ".exe"];
+    #[cfg(not(windows))]
+    let exts: &[&str] = &[""];
+
+    for dir in path_var.split(if cfg!(windows) { ';' } else { ':' }) {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in exts {
+            let candidate = Path::new(dir).join(format!("{}{}", prog, ext));
+            if candidate.exists() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return prog.to_string();
+    }
+
+    let is_shim = |p: &PathBuf| {
+        p.to_string_lossy().to_lowercase().contains("scoop\\shims")
+    };
+
+    let mut real: Vec<PathBuf> =
+        candidates.iter().filter(|p| !is_shim(p)).cloned().collect();
+
+    let chosen = if !real.is_empty() {
+        real.remove(0)
+    } else {
+        candidates.remove(0)
+    };
+
+    chosen.to_string_lossy().to_string()
+}
+
+// =========================
+// Config parsing (new DSL)
+// =========================
+
+fn load_config(path: &Path) -> Result<Vec<Project>, AnyError> {
+    let mut text = fs::read_to_string(path)?;
+
+    if text.starts_with('\u{feff}') {
+        println!(
+            "warning: UTF‑8 BOM found in {:?} — stripping it before parsing",
+            path
+        );
+        text = text.trim_start_matches('\u{feff}').to_string();
+    }
+
+    let mut projects: Vec<Project> = Vec::new();
+
+    let mut current_project: Option<Project> = None;
+    let mut in_block = false;
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if !in_block {
+            if line.starts_with("project ") && line.ends_with('{') {
+                let header = &line[..line.len() - 1].trim();
+                let mut parts = header.split_whitespace();
+                let kw = parts.next().unwrap_or("");
+                if kw != "project" {
+                    return Err(format!("Expected 'project <Name> {{' at line {}", line_no).into());
+                }
+                let name = parts
+                    .next()
+                    .ok_or_else(|| format!("Missing project name at line {}", line_no))?;
+                if parts.next().is_some() {
+                    return Err(format!("Unexpected extra tokens in project header at line {}", line_no).into());
+                }
+
+                current_project = Some(Project {
+                    name: name.to_string(),
+                    language: "cpp".to_string(),
+                    sources_pattern: String::new(),
+                    include_dirs: Vec::new(),
+                    cxx_flags: Vec::new(),
+                    output: String::new(),
+                });
+                in_block = true;
+            } else {
+                return Err(format!(
+                    "Expected 'project <Name> {{' at line {}, got: {}",
+                    line_no, line
+                )
+                .into());
+            }
+            continue;
+        }
+
+        if line == "}" {
+            if let Some(p) = current_project.take() {
+                if p.sources_pattern.is_empty() {
+                    return Err(format!("Project '{}' missing 'sources' definition", p.name).into());
+                }
+                if p.output.is_empty() {
+                    return Err(format!("Project '{}' missing 'output' definition", p.name).into());
+                }
+                projects.push(p);
+            } else {
+                return Err(format!("Closing '}}' with no open project at line {}", line_no).into());
+            }
+            in_block = false;
+            continue;
+        }
+
+        let eq_pos = line
+            .find('=')
+            .ok_or_else(|| format!("Expected 'key = value' inside project at line {}", line_no))?;
+        let key = line[..eq_pos].trim();
+        let value = line[eq_pos + 1..].trim();
+
+        if let Some(ref mut proj) = current_project {
+            match key {
+                "language" => {
+                    proj.language = value.to_string();
+                }
+                "sources" => {
+                    proj.sources_pattern = parse_sources_value(value, line_no)?;
+                }
+                "include_dirs" => {
+                    proj.include_dirs = parse_list_of_strings(value, line_no)?;
+                }
+                "cxx_flags" => {
+                    proj.cxx_flags = parse_list_of_strings(value, line_no)?;
+                }
+                "output" => {
+                    proj.output = parse_string_literal(value, line_no)?;
+                }
+                _ => {
+                    return Err(format!(
+                        "Unknown key '{}' in project '{}' at line {}",
+                        key, proj.name, line_no
+                    )
+                    .into());
+                }
+            }
+        } else {
+            return Err(format!("Internal error: in_block but no current project at line {}", line_no).into());
+        }
+    }
+
+    if in_block {
+        return Err("Unclosed project block at end of config file".into());
+    }
+
+    Ok(projects)
+}
+
+fn parse_sources_value(value: &str, line_no: usize) -> Result<String, AnyError> {
+    let v = value.trim();
+    if !v.starts_with("glob(") || !v.ends_with(')') {
+        return Err(format!(
+            "Expected sources = glob(\"pattern\") at line {}, got: {}",
+            line_no, v
+        )
+        .into());
+    }
+    let inner = &v[5..v.len() - 1].trim();
+    parse_string_literal(inner, line_no)
+}
+
+fn parse_string_literal(value: &str, line_no: usize) -> Result<String, AnyError> {
+    let v = value.trim();
+    if v.len() < 2 || !v.starts_with('"') || !v.ends_with('"') {
+        return Err(format!(
+            "Expected string literal in double quotes at line {}, got: {}",
+            line_no, v
+        )
+        .into());
+    }
+    Ok(v[1..v.len() - 1].to_string())
+}
+
+fn parse_list_of_strings(value: &str, line_no: usize) -> Result<Vec<String>, AnyError> {
+    let v = value.trim();
+    if !v.starts_with('[') || !v.ends_with(']') {
+        return Err(format!(
+            "Expected list syntax [\"a\", \"b\"] at line {}, got: {}",
+            line_no, v
+        )
+        .into());
+    }
+    let inner = &v[1..v.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for part in inner.split(',') {
+        let s = parse_string_literal(part.trim(), line_no)?;
+        result.push(s);
+    }
+    Ok(result)
+}
+
+// =========================
+// Project listing
+// =========================
+
+fn list_projects(projects: &[Project]) {
+    if projects.is_empty() {
+        println!("No projects defined.");
+        return;
+    }
+
+    println!("Projects:");
+    for p in projects {
+        println!("- {} (language: {}, output: {})", p.name, p.language, p.output);
+    }
+}
+
+// =========================
+// Build logic (with Rayon)
+// =========================
+fn random_nag() -> &'static str {
+    const NAGS: &[&str] = &[
+        "Hi! I'm CalBuild, and I am a crashaholic!",
+        "CalBuild is disappointed in you.",
+        "You had ONE job.",
+        "The compiler weeps silently.",
+        "Somewhere, a CPU core just sighed.",
+        "This is why we can't have nice things.",
+        "Error detected. Confidence in humanity reduced.",
+        "Congratulations! You broke it.",
+        "If you cry, I will personally roast you in the next release notes.",
+    ];
+
+    let idx = fastrand::usize(..NAGS.len());
+    NAGS[idx]
+}
+fn build_project(
+    project: &Project,
+    cache: &Arc<Mutex<HashMap<String, String>>>,
+) -> Result<(), AnyError> {
+    println!("== Project: {} ==", project.name);
+
+    if project.language != "cpp" && project.language != "c++" {
+        return Err(format!(
+            "Unsupported language '{}' in project '{}'; only 'cpp' is supported for now.",
+            project.language, project.name
+        )
+        .into());
+    }
+
+    let sources = expand_glob(&project.sources_pattern)?;
+    if sources.is_empty() {
+        return Err(format!(
+            "No sources matched pattern '{}' in project '{}'",
+            project.sources_pattern, project.name
+        )
+        .into());
+    }
+
+    let jobs: Vec<(PathBuf, PathBuf)> = sources
+        .iter()
+        .map(|src| {
+            let obj = object_path_for(project, src);
+            (src.clone(), obj)
+        })
+        .collect();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(BuildStats::default());
+
+    let result: Result<(), AnyError> = jobs
+        .par_iter()
+        .try_for_each(|(src, obj)| {
+            if cancelled.load(Ordering::SeqCst) {
+                return Ok(()); // skip if already failed
+            }
+
+            match build_object(project, src, obj, cache) {
+                Ok(CompileOutcome::Skipped) => {
+                    stats.skipped_compiles.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+                Ok(CompileOutcome::Compiled) => {
+                    stats.successful_compiles.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("{}", random_nag());
+                    stats.failed_jobs.fetch_add(1, Ordering::SeqCst);
+                    cancelled.store(true, Ordering::SeqCst);
+                    Err(e)
+                }
+            }
+        });
+
+    if let Err(err) = result {
+
+        eprintln!("build FAILED.");
+        print_summary(project, &stats);
+        return Err(err);
+    }
+
+    let objects: Vec<PathBuf> = jobs.iter().map(|(_, obj)| obj.clone()).collect();
+
+    build_link(project, &objects, cache)?;
+
+    print_summary(project, &stats);
+
+    Ok(())
+}
+
+fn print_summary(project: &Project, stats: &BuildStats) {
+    let success = stats.successful_compiles.load(Ordering::SeqCst);
+    let skipped = stats.skipped_compiles.load(Ordering::SeqCst);
+    let failed = stats.failed_jobs.load(Ordering::SeqCst);
+
+    println!();
+    println!("--- Build summary for {} ---", project.name);
+    println!("----------------------------");
+    println!("Successful jobs: {}", success);
+    println!("Skipped jobs:    {}", skipped);
+    println!("Failed jobs:         {}", failed);
+    println!("----------------------------");
+    println!();
+}
+
+fn object_path_for(project: &Project, src: &Path) -> PathBuf {
+    let stem = src
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    PathBuf::from("build")
+        .join(&project.name)
+        .join(format!("{stem}.o"))
+}
+
+fn build_object(
+    project: &Project,
+    src: &Path,
+    obj: &Path,
+    cache: &Arc<Mutex<HashMap<String, String>>>,
+) -> Result<CompileOutcome, AnyError> {
+    let key = format!("obj:{}", obj.to_string_lossy());
+    let new_hash = hash_object(project, src)?;
+
+    let (old_hash, obj_exists) = {
+        let cache_guard = cache.lock().unwrap();
+        let old = cache_guard.get(&key).cloned();
+        let exists = obj.exists();
+        (old, exists)
+    };
+
+    if Some(new_hash.clone()) == old_hash && obj_exists {
+        println!("[COMP] {} (cached)", src.display());
+        return Ok(CompileOutcome::Skipped);
+    }
+
+    println!("[COMP] {}", src.display());
+
+    if let Some(parent) = obj.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut args: Vec<String> = Vec::new();
+    args.push("-c".to_string());
+    args.push(src.to_string_lossy().to_string());
+    args.push("-o".to_string());
+    args.push(obj.to_string_lossy().to_string());
+
+    for inc in &project.include_dirs {
+        args.push(format!("-I{}", inc));
+    }
+    for flag in &project.cxx_flags {
+        args.push(flag.to_string());
+    }
+
+    let program = resolve_program("clang++");
+
+    let output = cmd(&program, &args)
+        .stderr_to_stdout()
+        .stdout_capture()
+        .unchecked()
+        .run()?;
+
+    if !output.status.success() {
+        eprintln!("[!] Compile failed: {}", src.display());
+        let text = String::from_utf8_lossy(&output.stdout);
+        eprintln!("{text}");
+
+        return Err(format!("Compile failed: {}", src.display()).into());
+    }
+    println!("[COMP] {} (done)", src.display());
+
+    {
+        let mut cache_guard = cache.lock().unwrap(); // GAURD HIM!
+        cache_guard.insert(key, new_hash);
+    }
+
+    Ok(CompileOutcome::Compiled)
+}
+
+fn build_link(
+    project: &Project,
+    objects: &[PathBuf],
+    cache: &Arc<Mutex<HashMap<String, String>>>,
+) -> Result<(), AnyError> {
+    let key = format!("link:{}", project.name);
+    let new_hash = hash_link(project, objects)?;
+
+    let out_path = PathBuf::from(&project.output);
+    let (old_hash, out_exists) = {
+        let cache_guard = cache.lock().unwrap();
+        let old = cache_guard.get(&key).cloned();
+        let exists = out_path.exists();
+        (old, exists)
+    };
+
+    if Some(new_hash.clone()) == old_hash && out_exists {
+        println!("[LINK] {} (cached)", out_path.display());
+        return Ok(());
+    }
+
+    println!("[LINK] {}", out_path.display()); // linky link link.
+    if let Some(parent) = out_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut args: Vec<String> = Vec::new();
+    for obj in objects {
+        args.push(obj.to_string_lossy().to_string());
+    }
+    args.push("-o".to_string());
+    args.push(out_path.to_string_lossy().to_string());
+
+    let program = resolve_program("clang++");
+
+    let output = cmd(&program, &args)
+        .stderr_to_stdout()
+        .stdout_capture()
+        .unchecked()
+        .run()?;
+
+    if !output.status.success() {
+        eprintln!("[!] Link failed: {}", out_path.display());
+        let text = String::from_utf8_lossy(&output.stdout);
+        eprintln!("{text}");
+        eprintln!("-BUILD FAILED-");
+        return Err("Link failed".into());
+    }
+    println!("[LINK] {} (done)", out_path.display());
+
+    {
+        let mut cache_guard = cache.lock().unwrap();
+        cache_guard.insert(key, new_hash);
+    }
+
+    Ok(())
+}
+
+// =========================
+// Glob expansion (simple)
+// =========================
+
+fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, AnyError> {
+    let p = pattern.replace('\\', "/");
+    let parts: Vec<&str> = p.split('/').collect();
+    if parts.len() < 2 {
+        return Err(format!(
+            "Unsupported glob pattern '{}'; expected something like 'src/*.cpp'",
+            pattern
+        )
+        .into());
+    }
+    let dir = parts[..parts.len() - 1].join("/");
+    let last = parts[parts.len() - 1];
+    if !last.starts_with("*.") {
+        return Err(format!(
+            "Unsupported glob pattern '{}'; only '*.ext' supported in last segment",
+            pattern
+        )
+        .into());
+    }
+    let ext = &last[2..];
+
+    let dir_path = Path::new(&dir);
+    let mut result = Vec::new();
+    if !dir_path.exists() {
+        return Ok(result);
+    }
+
+    for entry in fs::read_dir(dir_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(e) = path.extension() {
+                if e.to_string_lossy() == ext {
+                    result.push(path);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// =========================
+// Hashing & cache
+// =========================
+
+fn hash_object(project: &Project, src: &Path) -> Result<String, AnyError> {
+    let mut hasher = Sha256::new();
+
+    let bytes = fs::read(src)?;
+    hasher.update(bytes);
+
+    hasher.update(project.language.as_bytes());
+    for inc in &project.include_dirs {
+        hasher.update(inc.as_bytes());
+    }
+    for flag in &project.cxx_flags {
+        hasher.update(flag.as_bytes());
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hash_link(project: &Project, objects: &[PathBuf]) -> Result<String, AnyError> {
+    let mut hasher = Sha256::new();
+
+    hasher.update(project.name.as_bytes());
+    hasher.update(project.output.as_bytes());
+    hasher.update(project.language.as_bytes());
+
+    for obj in objects {
+        hasher.update(obj.to_string_lossy().as_bytes());
+        if obj.exists() {
+            let meta = fs::metadata(obj)?;
+            let mtime = meta.modified().ok();
+            if let Some(t) = mtime {
+                if let Ok(dur) = t.duration_since(std::time::UNIX_EPOCH) {
+                    hasher.update(dur.as_secs().to_le_bytes());
+                    hasher.update(dur.subsec_nanos().to_le_bytes());
+                }
+            }
+        }
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn cache_path() -> PathBuf {
+    PathBuf::from("build/.calbuild-cache")
+}
+
+fn load_cache() -> HashMap<String, String> {
+    let path = cache_path();
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(key), Some(hash)) = (parts.next(), parts.next()) {
+            map.insert(key.to_string(), hash.to_string());
+        }
+    }
+
+    map
+}
+
+fn save_cache(cache: &HashMap<String, String>) -> Result<(), AnyError> {
+    let path = cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut out = String::new();
+    for (key, hash) in cache {
+        out.push_str(key);
+        out.push(' ');
+        out.push_str(hash);
+        out.push('\n');
+    }
+
+    fs::write(path, out)?;
+    Ok(())
+}
