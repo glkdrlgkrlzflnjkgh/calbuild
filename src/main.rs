@@ -71,7 +71,7 @@ fn main() -> Result<(), AnyError> {
 
     {
         let cache_guard = cache.lock().unwrap();
-        save_cache(&*cache_guard)?;
+        save_cache(&cache_guard)?;
     }
 
     Ok(())
@@ -473,8 +473,8 @@ fn gather_header_deps_inner(
         }
 
         // Only handle #include "foo.hpp" (local headers)
-        if let Some(start) = trimmed.find('"') {
-            if let Some(end) = trimmed[start + 1..].find('"') {
+        if let Some(start) = trimmed.find('"')
+            && let Some(end) = trimmed[start + 1..].find('"') {
                 let header_name = &trimmed[start + 1..start + 1 + end];
 
                 // 1) Try relative to the current file
@@ -495,7 +495,6 @@ fn gather_header_deps_inner(
                     }
                 }
             }
-        }
     }
 
     Ok(())
@@ -528,11 +527,10 @@ fn build_object(
 
     println!("[COMP] {}", src.display());
 
-    if let Some(parent) = obj.parent() {
-        if !parent.exists() {
+    if let Some(parent) = obj.parent()
+        && !parent.exists() {
             fs::create_dir_all(parent)?;
         }
-    }
 
     let mut args: Vec<String> = Vec::new();
     args.push("-c".to_string());
@@ -594,11 +592,10 @@ fn build_link(
     }
 
     println!("[LINK] {}", out_path.display()); // linky link link.
-    if let Some(parent) = out_path.parent() {
-        if !parent.exists() {
+    if let Some(parent) = out_path.parent()
+        && !parent.exists() {
             fs::create_dir_all(parent)?;
         }
-    }
 
     let mut args: Vec<String> = Vec::new();
     for obj in objects {
@@ -666,13 +663,11 @@ fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>, AnyError> {
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(e) = path.extension() {
-                if e.to_string_lossy() == ext {
+        if path.is_file()
+            && let Some(e) = path.extension()
+                && e.to_string_lossy() == ext {
                     result.push(path);
                 }
-            }
-        }
     }
 
     Ok(result)
@@ -721,12 +716,11 @@ fn hash_link(project: &Project, objects: &[PathBuf]) -> Result<String, AnyError>
         if obj.exists() {
             let meta = fs::metadata(obj)?;
             let mtime = meta.modified().ok();
-            if let Some(t) = mtime {
-                if let Ok(dur) = t.duration_since(std::time::UNIX_EPOCH) {
+            if let Some(t) = mtime
+                && let Ok(dur) = t.duration_since(std::time::UNIX_EPOCH) {
                     hasher.update(dur.as_secs().to_le_bytes());
                     hasher.update(dur.subsec_nanos().to_le_bytes());
                 }
-            }
         }
     }
 
